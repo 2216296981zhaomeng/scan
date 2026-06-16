@@ -1,0 +1,44 @@
+name: Build iOS Framework
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-ios-framework:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build static framework
+        run: |
+          chmod +x scripts/build-ios-framework.sh
+          ./scripts/build-ios-framework.sh
+
+      - name: Prepare HBuilderX plugin package
+        run: |
+          rm -rf dist
+          mkdir -p dist/Zhaiwo-NativeScan
+          cp package.json README.md dist/Zhaiwo-NativeScan/
+          cp -R ios dist/Zhaiwo-NativeScan/
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent Zhaiwo-NativeScan Zhaiwo-NativeScan-plugin.zip
+
+      - name: Upload framework
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZhaiwoNativeScan-framework
+          path: ios/ZhaiwoNativeScan.framework
+
+      - name: Upload HBuilderX plugin zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zhaiwo-NativeScan-plugin
+          path: dist/Zhaiwo-NativeScan-plugin.zip
