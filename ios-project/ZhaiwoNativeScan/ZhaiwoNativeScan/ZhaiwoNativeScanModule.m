@@ -1,0 +1,430 @@
+#import "ZhaiwoNativeScanModule.h"
+#import <AVFoundation/AVFoundation.h>
+#import <CoreImage/CoreImage.h>
+#import <Photos/Photos.h>
+#import <UIKit/UIKit.h>
+
+static NSInteger const ZWScanCodeCancel = 10;
+static NSInteger const ZWScanCodeError = 11;
+static NSInteger const ZWScanCodeSuccess = 1000;
+
+@interface ZhaiwoScanViewController : UIViewController <AVCaptureMetadataOutputObjectsDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+
+@property (nonatomic, copy) NSDictionary *options;
+@property (nonatomic, copy) UniModuleKeepAliveCallback callback;
+@property (nonatomic, strong) AVCaptureSession *session;
+@property (nonatomic, strong) AVCaptureVideoPreviewLayer *previewLayer;
+@property (nonatomic, assign) BOOL completed;
+@property (nonatomic, strong) UILabel *tipLabel;
+@property (nonatomic, strong) UIButton *torchButton;
+
+@end
+
+@interface ZhaiwoNativeScanModule ()
+
+@property (nonatomic, weak) ZhaiwoScanViewController *scanController;
+
+@end
+
+@implementation ZhaiwoNativeScanModule
+
+UNI_EXPORT_METHOD(@selector(mpaasScan:callback:))
+UNI_EXPORT_METHOD(@selector(scan:callback:))
+
+- (void)mpaasScan:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    [self startScan:options callback:callback];
+}
+
+- (void)scan:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    [self startScan:options callback:callback];
+}
+
+- (void)startScan:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *presenter = [self topViewController];
+        if (!presenter) {
+            [self invoke:callback result:[self error:@"ViewController unavailable" reason:@"noViewController"]];
+            return;
+        }
+        AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+        if (status == AVAuthorizationStatusDenied || status == AVAuthorizationStatusRestricted) {
+            [self invoke:callback result:[self error:@"Camera permission denied" reason:@"cameraDenied"]];
+            return;
+        }
+        if (status == AVAuthorizationStatusNotDetermined) {
+            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (!granted) {
+                        [self invoke:callback result:[self error:@"Camera permission denied" reason:@"cameraDenied"]];
+                        return;
+                    }
+                    [self presentScanner:options callback:callback from:presenter];
+                });
+            }];
+            return;
+        }
+        [self presentScanner:options callback:callback from:presenter];
+    });
+}
+
+- (void)presentScanner:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback from:(UIViewController *)presenter {
+    ZhaiwoScanViewController *vc = [[ZhaiwoScanViewController alloc] init];
+    vc.options = [options isKindOfClass:[NSDictionary class]] ? options : @{};
+    vc.callback = callback;
+    vc.modalPresentationStyle = UIModalPresentationFullScreen;
+    self.scanController = vc;
+    [presenter presentViewController:vc animated:YES completion:nil];
+}
+
+- (UIViewController *)topViewController {
+    UIWindow *window = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class]) {
+                continue;
+            }
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            for (UIWindow *item in windowScene.windows) {
+                if (item.isKeyWindow) {
+                    window = item;
+                    break;
+                }
+            }
+            if (window) {
+                break;
+            }
+        }
+    }
+    if (!window) {
+        window = UIApplication.sharedApplication.keyWindow;
+    }
+    UIViewController *top = window.rootViewController;
+    while (top.presentedViewController) {
+        top = top.presentedViewController;
+    }
+    if ([top isKindOfClass:UINavigationController.class]) {
+        top = ((UINavigationController *)top).topViewController;
+    }
+    if ([top isKindOfClass:UITabBarController.class]) {
+        top = ((UITabBarController *)top).selectedViewController;
+    }
+    return top;
+}
+
+- (NSDictionary *)error:(NSString *)message reason:(NSString *)reason {
+    return @{
+        @"resp_code": @(ZWScanCodeError),
+        @"resp_message": message ?: @"scan failed",
+        @"resp_result": @"",
+        @"source": @"Zhaiwo-NativeScan-iOS",
+        @"reason": reason ?: @"error",
+        @"canFallback": @YES
+    };
+}
+
+- (void)invoke:(UniModuleKeepAliveCallback)callback result:(NSDictionary *)result {
+    if (callback) {
+        callback(result, NO);
+    }
+}
+
+@end
+
+@implementation ZhaiwoScanViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    [self setupCamera];
+    [self setupOverlay];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    if (self.session && !self.session.isRunning) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [self.session startRunning];
+        });
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self stopSession];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.previewLayer.frame = self.view.bounds;
+}
+
+- (void)setupCamera {
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    if (!device) {
+        [self finishWithResult:[self error:@"Camera unavailable" reason:@"cameraUnavailable"]];
+        return;
+    }
+    NSError *error = nil;
+    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+    if (!input || error) {
+        [self finishWithResult:[self error:error.localizedDescription ?: @"Camera input failed" reason:@"cameraInputFailed"]];
+        return;
+    }
+    AVCaptureMetadataOutput *output = [[AVCaptureMetadataOutput alloc] init];
+    AVCaptureSession *session = [[AVCaptureSession alloc] init];
+    if ([session canSetSessionPreset:AVCaptureSessionPresetHigh]) {
+        session.sessionPreset = AVCaptureSessionPresetHigh;
+    }
+    if (![session canAddInput:input] || ![session canAddOutput:output]) {
+        [self finishWithResult:[self error:@"Scanner setup failed" reason:@"setupFailed"]];
+        return;
+    }
+    [session addInput:input];
+    [session addOutput:output];
+    [output setMetadataObjectsDelegate:self queue:dispatch_get_main_queue()];
+    output.metadataObjectTypes = [self supportedMetadataTypes:output.availableMetadataObjectTypes];
+    self.session = session;
+    self.previewLayer = [AVCaptureVideoPreviewLayer layerWithSession:session];
+    self.previewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    self.previewLayer.frame = self.view.bounds;
+    [self.view.layer insertSublayer:self.previewLayer atIndex:0];
+}
+
+- (void)setupOverlay {
+    UIVisualEffectView *topBar = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+    topBar.frame = CGRectMake(0, 0, self.view.bounds.size.width, 96);
+    topBar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
+    [self.view addSubview:topBar];
+
+    UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
+    cancel.frame = CGRectMake(16, 44, 64, 40);
+    [cancel setTitle:@"取消" forState:UIControlStateNormal];
+    [cancel setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [cancel addTarget:self action:@selector(cancelScan) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:cancel];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(90, 44, self.view.bounds.size.width - 180, 40)];
+    title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    title.text = [self stringOption:@"title" fallback:@"扫码"];
+    title.textColor = UIColor.whiteColor;
+    title.font = [UIFont boldSystemFontOfSize:18];
+    title.textAlignment = NSTextAlignmentCenter;
+    [self.view addSubview:title];
+
+    CGFloat width = MIN(self.view.bounds.size.width - 72, 300);
+    UIView *frame = [[UIView alloc] initWithFrame:CGRectMake((self.view.bounds.size.width - width) / 2.0, 180, width, width)];
+    frame.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+    frame.layer.borderWidth = 2;
+    frame.layer.borderColor = [UIColor colorWithRed:0.47 green:0.88 blue:0.83 alpha:1].CGColor;
+    frame.layer.cornerRadius = 12;
+    [self.view addSubview:frame];
+
+    self.tipLabel = [[UILabel alloc] initWithFrame:CGRectMake(28, CGRectGetMaxY(frame.frame) + 24, self.view.bounds.size.width - 56, 50)];
+    self.tipLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.tipLabel.text = [self stringOption:@"viewText" fallback:@"请对准二维码或条形码，保持画面清晰"];
+    self.tipLabel.textColor = UIColor.whiteColor;
+    self.tipLabel.font = [UIFont systemFontOfSize:15];
+    self.tipLabel.textAlignment = NSTextAlignmentCenter;
+    self.tipLabel.numberOfLines = 2;
+    [self.view addSubview:self.tipLabel];
+
+    self.torchButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.torchButton.frame = CGRectMake(40, self.view.bounds.size.height - 92, 124, 48);
+    self.torchButton.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleRightMargin;
+    [self.torchButton setTitle:[self stringOption:@"openTorchText" fallback:@"打开手电筒"] forState:UIControlStateNormal];
+    [self.torchButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.torchButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.38];
+    self.torchButton.layer.cornerRadius = 24;
+    [self.torchButton addTarget:self action:@selector(toggleTorch) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.torchButton];
+
+    if (![self boolOption:@"hideAlbum" fallback:NO]) {
+        UIButton *album = [UIButton buttonWithType:UIButtonTypeSystem];
+        album.frame = CGRectMake(self.view.bounds.size.width - 164, self.view.bounds.size.height - 92, 124, 48);
+        album.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleLeftMargin;
+        [album setTitle:@"相册" forState:UIControlStateNormal];
+        [album setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        album.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.38];
+        album.layer.cornerRadius = 24;
+        [album addTarget:self action:@selector(openAlbum) forControlEvents:UIControlEventTouchUpInside];
+        [self.view addSubview:album];
+    }
+}
+
+- (NSArray<AVMetadataObjectType> *)supportedMetadataTypes:(NSArray<AVMetadataObjectType> *)available {
+    NSMutableArray *types = [NSMutableArray array];
+    NSArray *wanted = @[
+        AVMetadataObjectTypeQRCode,
+        AVMetadataObjectTypeEAN13Code,
+        AVMetadataObjectTypeEAN8Code,
+        AVMetadataObjectTypeUPCECode,
+        AVMetadataObjectTypeCode128Code,
+        AVMetadataObjectTypeCode39Code,
+        AVMetadataObjectTypeCode39Mod43Code,
+        AVMetadataObjectTypeCode93Code,
+        AVMetadataObjectTypeInterleaved2of5Code,
+        AVMetadataObjectTypeITF14Code,
+        AVMetadataObjectTypePDF417Code,
+        AVMetadataObjectTypeDataMatrixCode,
+        AVMetadataObjectTypeAztecCode
+    ];
+    for (AVMetadataObjectType type in wanted) {
+        if ([available containsObject:type]) {
+            [types addObject:type];
+        }
+    }
+    return types.count ? types : available;
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output didOutputMetadataObjects:(NSArray<__kindof AVMetadataObject *> *)metadataObjects fromConnection:(AVCaptureConnection *)connection {
+    if (self.completed) {
+        return;
+    }
+    for (AVMetadataObject *object in metadataObjects) {
+        if (![object isKindOfClass:AVMetadataMachineReadableCodeObject.class]) {
+            continue;
+        }
+        NSString *value = ((AVMetadataMachineReadableCodeObject *)object).stringValue;
+        if (value.length > 0) {
+            [self finishWithResult:[self success:value]];
+            return;
+        }
+    }
+}
+
+- (void)toggleTorch {
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    if (!device.hasTorch) {
+        return;
+    }
+    NSError *error = nil;
+    if (![device lockForConfiguration:&error]) {
+        return;
+    }
+    device.torchMode = device.torchMode == AVCaptureTorchModeOn ? AVCaptureTorchModeOff : AVCaptureTorchModeOn;
+    NSString *title = device.torchMode == AVCaptureTorchModeOn ? [self stringOption:@"closeTorchText" fallback:@"关闭手电筒"] : [self stringOption:@"openTorchText" fallback:@"打开手电筒"];
+    [self.torchButton setTitle:title forState:UIControlStateNormal];
+    [device unlockForConfiguration];
+}
+
+- (void)openAlbum {
+    [self stopSession];
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.delegate = self;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (self.session && !self.session.isRunning) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                [self.session startRunning];
+            });
+        }
+    }];
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
+    UIImage *image = info[UIImagePickerControllerOriginalImage];
+    NSString *value = [self scanImage:image];
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (value.length > 0) {
+            [self finishWithResult:[self success:value]];
+        } else {
+            [self finishWithResult:[self error:@"No scan result" reason:@"emptyResult"]];
+        }
+    }];
+}
+
+- (NSString *)scanImage:(UIImage *)image {
+    if (!image.CGImage) {
+        return @"";
+    }
+    CIImage *ciImage = [[CIImage alloc] initWithCGImage:image.CGImage];
+    CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode context:nil options:@{CIDetectorAccuracy: CIDetectorAccuracyHigh}];
+    NSArray<CIFeature *> *features = [detector featuresInImage:ciImage];
+    for (CIFeature *feature in features) {
+        if ([feature isKindOfClass:CIQRCodeFeature.class]) {
+            NSString *value = ((CIQRCodeFeature *)feature).messageString;
+            if (value.length > 0) {
+                return value;
+            }
+        }
+    }
+    return @"";
+}
+
+- (void)cancelScan {
+    [self finishWithResult:[self cancelResult]];
+}
+
+- (void)finishWithResult:(NSDictionary *)result {
+    if (self.completed) {
+        return;
+    }
+    self.completed = YES;
+    [self stopSession];
+    UniModuleKeepAliveCallback callback = self.callback;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (callback) {
+            callback(result, NO);
+        }
+    }];
+}
+
+- (void)stopSession {
+    if (self.session && self.session.isRunning) {
+        [self.session stopRunning];
+    }
+}
+
+- (NSDictionary *)success:(NSString *)text {
+    return @{
+        @"resp_code": @(ZWScanCodeSuccess),
+        @"resp_message": @"success",
+        @"resp_result": text ?: @"",
+        @"result": text ?: @"",
+        @"source": @"Zhaiwo-NativeScan-iOS"
+    };
+}
+
+- (NSDictionary *)cancelResult {
+    return @{
+        @"resp_code": @(ZWScanCodeCancel),
+        @"resp_message": @"cancel",
+        @"resp_result": @"",
+        @"source": @"Zhaiwo-NativeScan-iOS",
+        @"canFallback": @NO
+    };
+}
+
+- (NSDictionary *)error:(NSString *)message reason:(NSString *)reason {
+    return @{
+        @"resp_code": @(ZWScanCodeError),
+        @"resp_message": message ?: @"scan failed",
+        @"resp_result": @"",
+        @"source": @"Zhaiwo-NativeScan-iOS",
+        @"reason": reason ?: @"error",
+        @"canFallback": @YES
+    };
+}
+
+- (NSString *)stringOption:(NSString *)key fallback:(NSString *)fallback {
+    id value = self.options[key];
+    if ([value isKindOfClass:NSString.class] && [value length] > 0) {
+        return value;
+    }
+    return fallback ?: @"";
+}
+
+- (BOOL)boolOption:(NSString *)key fallback:(BOOL)fallback {
+    id value = self.options[key];
+    if ([value respondsToSelector:@selector(boolValue)]) {
+        return [value boolValue];
+    }
+    return fallback;
+}
+
+@end
