@@ -379,11 +379,75 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         return @"";
     }
 
-    NSString *visionValue = [self scanImageWithVision:image];
-    if (visionValue.length > 0) {
-        return visionValue;
+    NSArray<UIImage *> *candidates = [self scanCandidateImages:image];
+    for (UIImage *candidate in candidates) {
+        NSString *visionValue = [self scanImageWithVision:candidate];
+        if (visionValue.length > 0) {
+            return visionValue;
+        }
+        NSString *coreImageValue = [self scanQRCodeWithCoreImage:candidate];
+        if (coreImageValue.length > 0) {
+            return coreImageValue;
+        }
     }
+    return @"";
+}
 
+- (NSArray<UIImage *> *)scanCandidateImages:(UIImage *)image {
+    NSMutableArray<UIImage *> *images = [NSMutableArray array];
+    [images addObject:image];
+
+    UIImage *normalized = [self normalizedScanImage:image maxPixel:2600.0];
+    if (normalized && normalized.CGImage) {
+        [images addObject:normalized];
+        UIImage *rotatedRight = [self image:normalized rotatedByRadians:M_PI_2];
+        UIImage *rotatedDown = [self image:normalized rotatedByRadians:M_PI];
+        UIImage *rotatedLeft = [self image:normalized rotatedByRadians:-M_PI_2];
+        if (rotatedRight) [images addObject:rotatedRight];
+        if (rotatedDown) [images addObject:rotatedDown];
+        if (rotatedLeft) [images addObject:rotatedLeft];
+    }
+    return images;
+}
+
+- (UIImage *)normalizedScanImage:(UIImage *)image maxPixel:(CGFloat)maxPixel {
+    if (!image.CGImage) {
+        return nil;
+    }
+    CGSize size = image.size;
+    CGFloat largest = MAX(size.width, size.height);
+    CGFloat scale = largest > maxPixel ? maxPixel / largest : 1.0;
+    CGSize targetSize = CGSizeMake(MAX(1.0, floor(size.width * scale)), MAX(1.0, floor(size.height * scale)));
+
+    UIGraphicsBeginImageContextWithOptions(targetSize, YES, 1.0);
+    [image drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
+    UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return normalized;
+}
+
+- (UIImage *)image:(UIImage *)image rotatedByRadians:(CGFloat)radians {
+    if (!image.CGImage) {
+        return nil;
+    }
+    CGRect rect = CGRectMake(0, 0, image.size.width, image.size.height);
+    CGRect rotatedRect = CGRectApplyAffineTransform(rect, CGAffineTransformMakeRotation(radians));
+    CGSize rotatedSize = CGSizeMake(fabs(rotatedRect.size.width), fabs(rotatedRect.size.height));
+
+    UIGraphicsBeginImageContextWithOptions(rotatedSize, YES, 1.0);
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    CGContextTranslateCTM(context, rotatedSize.width / 2.0, rotatedSize.height / 2.0);
+    CGContextRotateCTM(context, radians);
+    [image drawInRect:CGRectMake(-image.size.width / 2.0, -image.size.height / 2.0, image.size.width, image.size.height)];
+    UIImage *rotated = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return rotated;
+}
+
+- (NSString *)scanQRCodeWithCoreImage:(UIImage *)image {
+    if (!image.CGImage) {
+        return @"";
+    }
     CIImage *ciImage = [[CIImage alloc] initWithCGImage:image.CGImage];
     CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode context:nil options:@{CIDetectorAccuracy: CIDetectorAccuracyHigh}];
     NSArray<CIFeature *> *features = [detector featuresInImage:ciImage];
@@ -443,6 +507,7 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         case UIImageOrientationRightMirrored:
             return kCGImagePropertyOrientationRightMirrored;
     }
+    return kCGImagePropertyOrientationUp;
 }
 
 - (void)cancelScan {
