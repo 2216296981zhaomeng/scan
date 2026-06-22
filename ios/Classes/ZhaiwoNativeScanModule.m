@@ -20,6 +20,7 @@ static NSInteger const ZWScanCodeSuccess = 1000;
 @property (nonatomic, strong) UILabel *tipLabel;
 @property (nonatomic, strong) UIButton *torchButton;
 @property (nonatomic, strong) NSDictionary *lastAlbumDebug;
+@property (nonatomic, copy) NSString *lastAlbumImageSource;
 
 @end
 
@@ -378,27 +379,80 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
 }
 
 - (UIImage *)bestImageFromPickerInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
-    UIImage *assetImage = nil;
+    self.lastAlbumImageSource = @"";
+
+    if (@available(iOS 11.0, *)) {
+        id imageURL = info[UIImagePickerControllerImageURL];
+        if ([imageURL isKindOfClass:NSURL.class]) {
+            UIImage *urlImage = [UIImage imageWithContentsOfFile:((NSURL *)imageURL).path];
+            if (urlImage && urlImage.CGImage) {
+                self.lastAlbumImageSource = @"imageURL";
+                return urlImage;
+            }
+        }
+    }
+
     if (@available(iOS 11.0, *)) {
         id asset = info[UIImagePickerControllerPHAsset];
         if ([asset isKindOfClass:PHAsset.class]) {
-            assetImage = [self imageFromPhotoAsset:(PHAsset *)asset];
+            UIImage *dataImage = [self imageDataFromPhotoAsset:(PHAsset *)asset];
+            if (dataImage && dataImage.CGImage) {
+                self.lastAlbumImageSource = @"phAssetData";
+                return dataImage;
+            }
+
+            UIImage *assetImage = [self imageFromPhotoAsset:(PHAsset *)asset];
+            if (assetImage && assetImage.CGImage) {
+                self.lastAlbumImageSource = @"phAssetImage";
+                return assetImage;
+            }
         }
-    }
-    if (assetImage && assetImage.CGImage) {
-        return assetImage;
     }
 
     id originalImage = info[UIImagePickerControllerOriginalImage];
     if ([originalImage isKindOfClass:UIImage.class]) {
+        self.lastAlbumImageSource = @"originalImage";
         return originalImage;
     }
 
     id editedImage = info[UIImagePickerControllerEditedImage];
     if ([editedImage isKindOfClass:UIImage.class]) {
+        self.lastAlbumImageSource = @"editedImage";
         return editedImage;
     }
     return nil;
+}
+
+- (UIImage *)imageDataFromPhotoAsset:(PHAsset *)asset {
+    __block NSData *data = nil;
+    PHImageRequestOptions *options = [[PHImageRequestOptions alloc] init];
+    options.synchronous = YES;
+    options.networkAccessAllowed = YES;
+    options.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+    options.resizeMode = PHImageRequestOptionsResizeModeNone;
+
+    if (@available(iOS 13.0, *)) {
+        [[PHImageManager defaultManager] requestImageDataAndOrientationForAsset:asset
+                                                                        options:options
+                                                                  resultHandler:^(NSData * _Nullable imageData, NSString * _Nullable dataUTI, CGImagePropertyOrientation orientation, NSDictionary * _Nullable info) {
+            if (imageData.length > 0) {
+                data = imageData;
+            }
+        }];
+    } else {
+        [[PHImageManager defaultManager] requestImageDataForAsset:asset
+                                                          options:options
+                                                    resultHandler:^(NSData * _Nullable imageData, NSString * _Nullable dataUTI, UIImageOrientation orientation, NSDictionary * _Nullable info) {
+            if (imageData.length > 0) {
+                data = imageData;
+            }
+        }];
+    }
+
+    if (data.length == 0) {
+        return nil;
+    }
+    return [UIImage imageWithData:data];
 }
 
 - (UIImage *)imageFromPhotoAsset:(PHAsset *)asset {
@@ -433,6 +487,7 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
     debug[@"imageSize"] = @{ @"width": @(image.size.width), @"height": @(image.size.height), @"scale": @(image.scale) };
     debug[@"cgImageSize"] = @{ @"width": @(CGImageGetWidth(image.CGImage)), @"height": @(CGImageGetHeight(image.CGImage)) };
     debug[@"orientation"] = @(image.imageOrientation);
+    debug[@"albumImageSource"] = self.lastAlbumImageSource ?: @"";
 
     NSArray<UIImage *> *candidates = [self scanCandidateImages:image];
     NSMutableArray *candidateSizes = [NSMutableArray array];
@@ -479,35 +534,134 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
 
 - (NSArray<UIImage *> *)scanCandidateImages:(UIImage *)image {
     NSMutableArray<UIImage *> *images = [NSMutableArray array];
-    [images addObject:image];
+    [self addScanImage:image toArray:images];
 
-    UIImage *normalized = [self normalizedScanImage:image maxPixel:4096.0];
-    if (normalized && normalized.CGImage) {
-        [images addObject:normalized];
-        UIImage *rotatedRight = [self image:normalized rotatedByRadians:M_PI_2];
-        UIImage *rotatedDown = [self image:normalized rotatedByRadians:M_PI];
-        UIImage *rotatedLeft = [self image:normalized rotatedByRadians:-M_PI_2];
-        if (rotatedRight) [images addObject:rotatedRight];
-        if (rotatedDown) [images addObject:rotatedDown];
-        if (rotatedLeft) [images addObject:rotatedLeft];
+    UIImage *normalized = [self scaledScanImage:image minPixel:0.0 maxPixel:4096.0 interpolation:kCGInterpolationHigh];
+    [self addScanImage:normalized toArray:images];
+
+    UIImage *upscaled = [self scaledScanImage:image minPixel:1600.0 maxPixel:4096.0 interpolation:kCGInterpolationNone];
+    [self addScanImage:upscaled toArray:images];
+
+    UIImage *large = [self scaledScanImage:image minPixel:2400.0 maxPixel:4096.0 interpolation:kCGInterpolationNone];
+    [self addScanImage:large toArray:images];
+
+    NSMutableArray<UIImage *> *baseImages = [images copy].mutableCopy;
+    for (UIImage *base in baseImages) {
+        UIImage *enhanced = [self contrastScanImage:base];
+        [self addScanImage:enhanced toArray:images];
+
+        UIImage *threshold = [self thresholdScanImage:base threshold:0.55];
+        [self addScanImage:threshold toArray:images];
+
+        UIImage *rotatedRight = [self image:base rotatedByRadians:M_PI_2];
+        UIImage *rotatedDown = [self image:base rotatedByRadians:M_PI];
+        UIImage *rotatedLeft = [self image:base rotatedByRadians:-M_PI_2];
+        [self addScanImage:rotatedRight toArray:images];
+        [self addScanImage:rotatedDown toArray:images];
+        [self addScanImage:rotatedLeft toArray:images];
     }
     return images;
 }
 
-- (UIImage *)normalizedScanImage:(UIImage *)image maxPixel:(CGFloat)maxPixel {
+- (void)addScanImage:(UIImage *)image toArray:(NSMutableArray<UIImage *> *)images {
+    if (image && image.CGImage) {
+        [images addObject:image];
+    }
+}
+
+- (UIImage *)scaledScanImage:(UIImage *)image minPixel:(CGFloat)minPixel maxPixel:(CGFloat)maxPixel interpolation:(CGInterpolationQuality)quality {
     if (!image.CGImage) {
         return nil;
     }
     CGSize size = image.size;
     CGFloat largest = MAX(size.width, size.height);
-    CGFloat scale = largest > maxPixel ? maxPixel / largest : 1.0;
+    CGFloat scale = 1.0;
+    if (minPixel > 0 && largest < minPixel) {
+        scale = minPixel / MAX(largest, 1.0);
+    }
+    if (largest * scale > maxPixel) {
+        scale = maxPixel / MAX(largest, 1.0);
+    }
     CGSize targetSize = CGSizeMake(MAX(1.0, floor(size.width * scale)), MAX(1.0, floor(size.height * scale)));
 
     UIGraphicsBeginImageContextWithOptions(targetSize, YES, 1.0);
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    CGContextSetInterpolationQuality(context, quality);
     [image drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
     UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return normalized;
+}
+
+- (UIImage *)contrastScanImage:(UIImage *)image {
+    if (!image.CGImage) {
+        return nil;
+    }
+    CIImage *input = [[CIImage alloc] initWithCGImage:image.CGImage];
+    CIFilter *color = [CIFilter filterWithName:@"CIColorControls"];
+    [color setValue:input forKey:kCIInputImageKey];
+    [color setValue:@0 forKey:kCIInputSaturationKey];
+    [color setValue:@1.8 forKey:kCIInputContrastKey];
+    [color setValue:@0.02 forKey:kCIInputBrightnessKey];
+    CIImage *output = color.outputImage;
+    if (!output) {
+        return nil;
+    }
+
+    CIFilter *sharp = [CIFilter filterWithName:@"CISharpenLuminance"];
+    [sharp setValue:output forKey:kCIInputImageKey];
+    [sharp setValue:@0.7 forKey:kCIInputSharpnessKey];
+    output = sharp.outputImage ?: output;
+
+    CIContext *context = [CIContext contextWithOptions:nil];
+    CGImageRef cgImage = [context createCGImage:output fromRect:output.extent];
+    if (!cgImage) {
+        return nil;
+    }
+    UIImage *result = [UIImage imageWithCGImage:cgImage scale:1.0 orientation:UIImageOrientationUp];
+    CGImageRelease(cgImage);
+    return result;
+}
+
+- (UIImage *)thresholdScanImage:(UIImage *)image threshold:(CGFloat)threshold {
+    if (!image.CGImage) {
+        return nil;
+    }
+    size_t width = CGImageGetWidth(image.CGImage);
+    size_t height = CGImageGetHeight(image.CGImage);
+    if (width == 0 || height == 0) {
+        return nil;
+    }
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceGray();
+    CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, width, colorSpace, kCGImageAlphaNone);
+    CGColorSpaceRelease(colorSpace);
+    if (!context) {
+        return nil;
+    }
+
+    CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image.CGImage);
+    unsigned char *data = CGBitmapContextGetData(context);
+    size_t bytesPerRow = CGBitmapContextGetBytesPerRow(context);
+    unsigned char thresholdByte = (unsigned char)MAX(0, MIN(255, threshold * 255.0));
+    if (data) {
+        for (size_t y = 0; y < height; y++) {
+            unsigned char *row = data + y * bytesPerRow;
+            for (size_t x = 0; x < width; x++) {
+                row[x] = row[x] > thresholdByte ? 255 : 0;
+            }
+        }
+    }
+
+    CGImageRef cgImage = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    if (!cgImage) {
+        return nil;
+    }
+    UIImage *result = [UIImage imageWithCGImage:cgImage scale:1.0 orientation:UIImageOrientationUp];
+    CGImageRelease(cgImage);
+    return result;
 }
 
 - (UIImage *)image:(UIImage *)image rotatedByRadians:(CGFloat)radians {
@@ -574,6 +728,14 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
                 }
             }
         }];
+        @try {
+            NSArray<VNBarcodeSymbology> *symbologies = [self supportedVisionBarcodeSymbologiesForRequest:request];
+            if (symbologies.count > 0) {
+                request.symbologies = symbologies;
+            }
+        } @catch (NSException *exception) {
+            requestError = exception.reason ?: exception.name;
+        }
         VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage orientation:[self cgImageOrientationFromImageOrientation:image.imageOrientation] options:@{}];
         NSError *error = nil;
         [handler performRequests:@[request] error:&error];
@@ -589,6 +751,42 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         *errorMessage = @"Vision requires iOS 11.0+";
     }
     return @"";
+}
+
+- (NSArray<VNBarcodeSymbology> *)supportedVisionBarcodeSymbologiesForRequest:(VNDetectBarcodesRequest *)request API_AVAILABLE(ios(11.0)) {
+    NSArray<VNBarcodeSymbology> *wanted = @[
+        VNBarcodeSymbologyQR,
+        VNBarcodeSymbologyAztec,
+        VNBarcodeSymbologyDataMatrix,
+        VNBarcodeSymbologyPDF417,
+        VNBarcodeSymbologyEAN13,
+        VNBarcodeSymbologyEAN8,
+        VNBarcodeSymbologyUPCE,
+        VNBarcodeSymbologyCode39,
+        VNBarcodeSymbologyCode39Checksum,
+        VNBarcodeSymbologyCode39FullASCII,
+        VNBarcodeSymbologyCode39FullASCIIChecksum,
+        VNBarcodeSymbologyCode93,
+        VNBarcodeSymbologyCode128,
+        VNBarcodeSymbologyITF14,
+        VNBarcodeSymbologyI2of5,
+        VNBarcodeSymbologyI2of5Checksum
+    ];
+
+    if ([request respondsToSelector:@selector(supportedSymbologiesAndReturnError:)]) {
+        NSError *error = nil;
+        NSArray<VNBarcodeSymbology> *available = [request supportedSymbologiesAndReturnError:&error];
+        if (available.count > 0) {
+            NSMutableArray<VNBarcodeSymbology> *supported = [NSMutableArray array];
+            for (VNBarcodeSymbology symbology in wanted) {
+                if ([available containsObject:symbology]) {
+                    [supported addObject:symbology];
+                }
+            }
+            return supported.count > 0 ? supported : available;
+        }
+    }
+    return wanted;
 }
 
 - (CGImagePropertyOrientation)cgImageOrientationFromImageOrientation:(UIImageOrientation)orientation {
