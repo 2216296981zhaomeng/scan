@@ -545,7 +545,7 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
     UIImage *large = [self scaledScanImage:image minPixel:2400.0 maxPixel:4096.0 interpolation:kCGInterpolationNone];
     [self addScanImage:large toArray:images];
 
-    NSMutableArray<UIImage *> *baseImages = [images copy].mutableCopy;
+    NSArray<UIImage *> *baseImages = [images copy];
     for (UIImage *base in baseImages) {
         UIImage *enhanced = [self contrastScanImage:base];
         [self addScanImage:enhanced toArray:images];
@@ -773,7 +773,7 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         VNBarcodeSymbologyI2of5Checksum
     ];
 
-    if ([request respondsToSelector:@selector(supportedSymbologiesAndReturnError:)]) {
+    if (@available(iOS 15.0, *)) {
         NSError *error = nil;
         NSArray<VNBarcodeSymbology> *available = [request supportedSymbologiesAndReturnError:&error];
         if (available.count > 0) {
