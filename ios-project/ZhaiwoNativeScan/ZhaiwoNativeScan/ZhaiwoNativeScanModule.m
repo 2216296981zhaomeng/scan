@@ -19,6 +19,7 @@ static NSInteger const ZWScanCodeSuccess = 1000;
 @property (nonatomic, assign) BOOL completed;
 @property (nonatomic, strong) UILabel *tipLabel;
 @property (nonatomic, strong) UIButton *torchButton;
+@property (nonatomic, strong) NSDictionary *lastAlbumDebug;
 
 @end
 
@@ -122,6 +123,14 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         @"reason": reason ?: @"error",
         @"canFallback": @YES
     };
+}
+
+- (NSDictionary *)error:(NSString *)message reason:(NSString *)reason debug:(NSDictionary *)debug {
+    NSMutableDictionary *result = [[self error:message reason:reason] mutableCopy];
+    if (debug) {
+        result[@"debug"] = debug;
+    }
+    return result;
 }
 
 - (void)invoke:(UniModuleKeepAliveCallback)callback result:(NSDictionary *)result {
@@ -356,40 +365,115 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
-    UIImage *image = nil;
-    id editedImage = info[UIImagePickerControllerEditedImage];
-    id originalImage = info[UIImagePickerControllerOriginalImage];
-    if ([editedImage isKindOfClass:UIImage.class]) {
-        image = editedImage;
-    } else if ([originalImage isKindOfClass:UIImage.class]) {
-        image = originalImage;
-    }
+    UIImage *image = [self bestImageFromPickerInfo:info];
     NSString *value = [self scanImage:image];
+    NSDictionary *debug = self.lastAlbumDebug ?: @{};
     [picker dismissViewControllerAnimated:YES completion:^{
         if (value.length > 0) {
             [self finishWithResult:[self success:value]];
         } else {
-            [self finishWithResult:[self error:@"No scan result" reason:@"emptyResult"]];
+            [self finishWithResult:[self error:@"No scan result" reason:@"emptyResult" debug:debug]];
         }
     }];
 }
 
+- (UIImage *)bestImageFromPickerInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
+    UIImage *assetImage = nil;
+    if (@available(iOS 11.0, *)) {
+        id asset = info[UIImagePickerControllerPHAsset];
+        if ([asset isKindOfClass:PHAsset.class]) {
+            assetImage = [self imageFromPhotoAsset:(PHAsset *)asset];
+        }
+    }
+    if (assetImage && assetImage.CGImage) {
+        return assetImage;
+    }
+
+    id originalImage = info[UIImagePickerControllerOriginalImage];
+    if ([originalImage isKindOfClass:UIImage.class]) {
+        return originalImage;
+    }
+
+    id editedImage = info[UIImagePickerControllerEditedImage];
+    if ([editedImage isKindOfClass:UIImage.class]) {
+        return editedImage;
+    }
+    return nil;
+}
+
+- (UIImage *)imageFromPhotoAsset:(PHAsset *)asset {
+    __block UIImage *image = nil;
+    PHImageRequestOptions *options = [[PHImageRequestOptions alloc] init];
+    options.synchronous = YES;
+    options.networkAccessAllowed = YES;
+    options.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+    options.resizeMode = PHImageRequestOptionsResizeModeNone;
+    [[PHImageManager defaultManager] requestImageForAsset:asset
+                                               targetSize:PHImageManagerMaximumSize
+                                              contentMode:PHImageContentModeDefault
+                                                  options:options
+                                            resultHandler:^(UIImage * _Nullable result, NSDictionary * _Nullable info) {
+        if (result && result.CGImage) {
+            image = result;
+        }
+    }];
+    return image;
+}
+
 - (NSString *)scanImage:(UIImage *)image {
+    NSMutableDictionary *debug = [NSMutableDictionary dictionary];
+    debug[@"imagePicked"] = @(image != nil);
     if (!image.CGImage) {
+        debug[@"imageHasCGImage"] = @NO;
+        self.lastAlbumDebug = debug;
         return @"";
     }
 
+    debug[@"imageHasCGImage"] = @YES;
+    debug[@"imageSize"] = @{ @"width": @(image.size.width), @"height": @(image.size.height), @"scale": @(image.scale) };
+    debug[@"cgImageSize"] = @{ @"width": @(CGImageGetWidth(image.CGImage)), @"height": @(CGImageGetHeight(image.CGImage)) };
+    debug[@"orientation"] = @(image.imageOrientation);
+
     NSArray<UIImage *> *candidates = [self scanCandidateImages:image];
+    NSMutableArray *candidateSizes = [NSMutableArray array];
+    NSInteger totalVisionObservations = 0;
+    NSMutableArray *visionErrors = [NSMutableArray array];
+    debug[@"candidateCount"] = @(candidates.count);
+
     for (UIImage *candidate in candidates) {
-        NSString *visionValue = [self scanImageWithVision:candidate];
+        if (!candidate.CGImage) {
+            continue;
+        }
+        [candidateSizes addObject:@{
+            @"width": @(candidate.size.width),
+            @"height": @(candidate.size.height),
+            @"cgWidth": @(CGImageGetWidth(candidate.CGImage)),
+            @"cgHeight": @(CGImageGetHeight(candidate.CGImage)),
+            @"orientation": @(candidate.imageOrientation)
+        }];
+
+        NSInteger observationCount = 0;
+        NSString *visionError = @"";
+        NSString *visionValue = [self scanImageWithVision:candidate observationCount:&observationCount errorMessage:&visionError];
+        totalVisionObservations += observationCount;
+        if (visionError.length > 0) {
+            [visionErrors addObject:visionError];
+        }
         if (visionValue.length > 0) {
+            self.lastAlbumDebug = debug;
             return visionValue;
         }
         NSString *coreImageValue = [self scanQRCodeWithCoreImage:candidate];
         if (coreImageValue.length > 0) {
+            self.lastAlbumDebug = debug;
             return coreImageValue;
         }
     }
+
+    debug[@"candidateSizes"] = candidateSizes;
+    debug[@"visionObservationCount"] = @(totalVisionObservations);
+    debug[@"visionErrors"] = visionErrors;
+    self.lastAlbumDebug = debug;
     return @"";
 }
 
@@ -397,7 +481,7 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
     NSMutableArray<UIImage *> *images = [NSMutableArray array];
     [images addObject:image];
 
-    UIImage *normalized = [self normalizedScanImage:image maxPixel:2600.0];
+    UIImage *normalized = [self normalizedScanImage:image maxPixel:4096.0];
     if (normalized && normalized.CGImage) {
         [images addObject:normalized];
         UIImage *rotatedRight = [self image:normalized rotatedByRadians:M_PI_2];
@@ -462,13 +546,23 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
     return @"";
 }
 
-- (NSString *)scanImageWithVision:(UIImage *)image {
+- (NSString *)scanImageWithVision:(UIImage *)image observationCount:(NSInteger *)observationCount errorMessage:(NSString **)errorMessage {
+    if (observationCount) {
+        *observationCount = 0;
+    }
+    if (errorMessage) {
+        *errorMessage = @"";
+    }
     if (@available(iOS 11.0, *)) {
         __block NSString *result = @"";
+        __block NSInteger count = 0;
+        __block NSString *requestError = @"";
         VNDetectBarcodesRequest *request = [[VNDetectBarcodesRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
             if (error) {
+                requestError = error.localizedDescription ?: @"Vision barcode request failed";
                 return;
             }
+            count = request.results.count;
             for (VNObservation *observation in request.results) {
                 if (![observation isKindOfClass:VNBarcodeObservation.class]) {
                     continue;
@@ -483,7 +577,16 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage orientation:[self cgImageOrientationFromImageOrientation:image.imageOrientation] options:@{}];
         NSError *error = nil;
         [handler performRequests:@[request] error:&error];
+        if (observationCount) {
+            *observationCount = count;
+        }
+        if (errorMessage) {
+            *errorMessage = requestError.length > 0 ? requestError : (error.localizedDescription ?: @"");
+        }
         return result ?: @"";
+    }
+    if (errorMessage) {
+        *errorMessage = @"Vision requires iOS 11.0+";
     }
     return @"";
 }
@@ -563,6 +666,14 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         @"reason": reason ?: @"error",
         @"canFallback": @YES
     };
+}
+
+- (NSDictionary *)error:(NSString *)message reason:(NSString *)reason debug:(NSDictionary *)debug {
+    NSMutableDictionary *result = [[self error:message reason:reason] mutableCopy];
+    if (debug) {
+        result[@"debug"] = debug;
+    }
+    return result;
 }
 
 - (NSString *)stringOption:(NSString *)key fallback:(NSString *)fallback {

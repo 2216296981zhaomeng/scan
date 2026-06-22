@@ -1,7 +1,7 @@
 {
   "name": "Zhaiwo-NativeScan",
   "id": "Zhaiwo-NativeScan",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Local uni-app native scan bridge for Android and iOS. It keeps the existing scan response shape.",
   "_dp_type": "nativeplugin",
   "_dp_nativeplugin": {
