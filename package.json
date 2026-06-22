@@ -1,8 +1,8 @@
 {
   "name": "Zhaiwo-NativeScan",
   "id": "Zhaiwo-NativeScan",
-  "version": "1.0.0",
-  "description": "Local uni-app native scan bridge for Android and iOS. It keeps the Mpaas-Scan response shape.",
+  "version": "1.0.5",
+  "description": "Local uni-app native scan bridge for Android and iOS. It keeps the existing scan response shape.",
   "_dp_type": "nativeplugin",
   "_dp_nativeplugin": {
     "ios": {
@@ -19,12 +19,14 @@
         "Foundation.framework",
         "AVFoundation.framework",
         "CoreImage.framework",
+        "ImageIO.framework",
         "Photos.framework",
+        "Vision.framework",
         "ZhaiwoNativeScan.framework"
       ],
       "plists": {
         "NSCameraUsageDescription": "用于扫描二维码和条形码",
-        "NSPhotoLibraryUsageDescription": "用于从相册选择二维码图片"
+        "NSPhotoLibraryUsageDescription": "用于从相册选择二维码和条形码图片"
       },
       "privacies": [
         "NSCameraUsageDescription",

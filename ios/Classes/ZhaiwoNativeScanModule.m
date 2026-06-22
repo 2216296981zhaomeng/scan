@@ -1,8 +1,10 @@
 #import "ZhaiwoNativeScanModule.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 #import <Photos/Photos.h>
 #import <UIKit/UIKit.h>
+#import <Vision/Vision.h>
 
 static NSInteger const ZWScanCodeCancel = 10;
 static NSInteger const ZWScanCodeError = 11;
@@ -309,6 +311,33 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
 
 - (void)openAlbum {
     [self stopSession];
+    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
+        [self finishWithResult:[self error:@"Photo library unavailable" reason:@"photoLibraryUnavailable"]];
+        return;
+    }
+
+    PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
+    if (status == PHAuthorizationStatusDenied || status == PHAuthorizationStatusRestricted) {
+        [self finishWithResult:[self error:@"Photo library permission denied" reason:@"photoLibraryDenied"]];
+        return;
+    }
+    if (status == PHAuthorizationStatusNotDetermined) {
+        [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus newStatus) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (newStatus == PHAuthorizationStatusDenied || newStatus == PHAuthorizationStatusRestricted) {
+                    [self finishWithResult:[self error:@"Photo library permission denied" reason:@"photoLibraryDenied"]];
+                    return;
+                }
+                [self presentAlbumPicker];
+            });
+        }];
+        return;
+    }
+
+    [self presentAlbumPicker];
+}
+
+- (void)presentAlbumPicker {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.delegate = self;
@@ -327,7 +356,14 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
-    UIImage *image = info[UIImagePickerControllerOriginalImage];
+    UIImage *image = nil;
+    id editedImage = info[UIImagePickerControllerEditedImage];
+    id originalImage = info[UIImagePickerControllerOriginalImage];
+    if ([editedImage isKindOfClass:UIImage.class]) {
+        image = editedImage;
+    } else if ([originalImage isKindOfClass:UIImage.class]) {
+        image = originalImage;
+    }
     NSString *value = [self scanImage:image];
     [picker dismissViewControllerAnimated:YES completion:^{
         if (value.length > 0) {
@@ -342,6 +378,12 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
     if (!image.CGImage) {
         return @"";
     }
+
+    NSString *visionValue = [self scanImageWithVision:image];
+    if (visionValue.length > 0) {
+        return visionValue;
+    }
+
     CIImage *ciImage = [[CIImage alloc] initWithCGImage:image.CGImage];
     CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode context:nil options:@{CIDetectorAccuracy: CIDetectorAccuracyHigh}];
     NSArray<CIFeature *> *features = [detector featuresInImage:ciImage];
@@ -354,6 +396,53 @@ UNI_EXPORT_METHOD(@selector(scan:callback:))
         }
     }
     return @"";
+}
+
+- (NSString *)scanImageWithVision:(UIImage *)image {
+    if (@available(iOS 11.0, *)) {
+        __block NSString *result = @"";
+        VNDetectBarcodesRequest *request = [[VNDetectBarcodesRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
+            if (error) {
+                return;
+            }
+            for (VNObservation *observation in request.results) {
+                if (![observation isKindOfClass:VNBarcodeObservation.class]) {
+                    continue;
+                }
+                NSString *value = ((VNBarcodeObservation *)observation).payloadStringValue;
+                if (value.length > 0) {
+                    result = value;
+                    break;
+                }
+            }
+        }];
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage orientation:[self cgImageOrientationFromImageOrientation:image.imageOrientation] options:@{}];
+        NSError *error = nil;
+        [handler performRequests:@[request] error:&error];
+        return result ?: @"";
+    }
+    return @"";
+}
+
+- (CGImagePropertyOrientation)cgImageOrientationFromImageOrientation:(UIImageOrientation)orientation {
+    switch (orientation) {
+        case UIImageOrientationUp:
+            return kCGImagePropertyOrientationUp;
+        case UIImageOrientationDown:
+            return kCGImagePropertyOrientationDown;
+        case UIImageOrientationLeft:
+            return kCGImagePropertyOrientationLeft;
+        case UIImageOrientationRight:
+            return kCGImagePropertyOrientationRight;
+        case UIImageOrientationUpMirrored:
+            return kCGImagePropertyOrientationUpMirrored;
+        case UIImageOrientationDownMirrored:
+            return kCGImagePropertyOrientationDownMirrored;
+        case UIImageOrientationLeftMirrored:
+            return kCGImagePropertyOrientationLeftMirrored;
+        case UIImageOrientationRightMirrored:
+            return kCGImagePropertyOrientationRightMirrored;
+    }
 }
 
 - (void)cancelScan {
